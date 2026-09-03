@@ -6,12 +6,13 @@ ensure_network() {
     local iface
     iface=$(nmcli -t -f DEVICE,TYPE connection show | grep ethernet | cut -d: -f1)
     if [ -z "$iface" ]; then echo "Aucune interface trouvée."; exit 1; fi
+    sudo nmcli connection up "$iface"
+    sudo nmcli connection modify "$iface" connection.autoconnect yes
+    sleep 2
     if ! ping -c1 -W2 8.8.8.8 &>/dev/null; then
-        sudo nmcli connection up "$iface"
-        sudo nmcli connection modify "$iface" connection.autoconnect yes
-        sleep 2
+        echo "Échec réseau."
+        exit 1
     fi
-    ping -c1 -W2 8.8.8.8 &>/dev/null || { echo "Échec réseau."; exit 1; }
     echo "Réseau OK."
 }
 ensure_network
