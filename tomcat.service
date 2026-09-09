@@ -1,19 +1,41 @@
 [Unit]
 Description=Apache Tomcat 9 Web Application Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=forking
+PIDFile=/opt/tomcat/temp/tomcat.pid
+
+User=tomcat
+Group=tomcat
+UMask=0007
 
 Environment=JAVA_HOME=/usr/lib/jvm/java-11-openjdk
 Environment=CATALINA_HOME=/opt/tomcat
+Environment=CATALINA_BASE=/opt/tomcat
 Environment=CATALINA_PID=/opt/tomcat/temp/tomcat.pid
+Environment=CATALINA_OPTS=-Xms512m -Xmx1024m -XX:MaxMetaspaceSize=256m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true
+Environment=JAVA_OPTS=-Djava.awt.headless=true
 
 ExecStart=/opt/tomcat/bin/startup.sh
 ExecStop=/opt/tomcat/bin/shutdown.sh
 
-User=root
-Group=root 
+TimeoutStartSec=60
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+LimitNOFILE=65535
+LimitNPROC=4096
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tomcat/logs /opt/tomcat/temp /opt/tomcat/work /opt/tomcat/webapps
 
 [Install]
 WantedBy=multi-user.target
