@@ -257,9 +257,15 @@ fix_repos_eol() {
 # ----------------------------------------------------------------------------
 install_java() {
     local version
+    # IFS a été restreint à \n\t en tête de script (pas d'espace), donc un
+    # simple 'for version in $JAVA_VERSIONS' ne découperait jamais "11 17"
+    # en deux mots. On force le découpage par espace ici, indépendamment
+    # de IFS, via read -ra.
+    local -a versions_arr
+    IFS=' ' read -ra versions_arr <<< "$JAVA_VERSIONS"
 
     # 1) Si l'une des versions candidates est déjà installée, ne rien faire.
-    for version in $JAVA_VERSIONS; do
+    for version in "${versions_arr[@]}"; do
         if rpm -q "java-${version}-openjdk-devel" &>/dev/null; then
             log "Java ${version} déjà installé, étape ignorée."
             return 0
@@ -268,7 +274,7 @@ install_java() {
 
     # 2) Sinon, essayer chaque version candidate dans l'ordre jusqu'à en trouver
     #    une disponible dans les dépôts.
-    for version in $JAVA_VERSIONS; do
+    for version in "${versions_arr[@]}"; do
         if yum list available "java-${version}-openjdk-devel" &>/dev/null; then
             log "Installation de Java ${version}..."
             yum install -y "java-${version}-openjdk" "java-${version}-openjdk-devel"
