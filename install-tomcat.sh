@@ -34,7 +34,8 @@ TOMCAT_MAJOR="${TOMCAT_MAJOR:-9}"
 TOMCAT_VERSION="${TOMCAT_VERSION:-9.0.121}"
 TOMCAT_URL="https://archive.apache.org/dist/tomcat/tomcat-${TOMCAT_MAJOR}/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
 HTTP_PORT="${HTTP_PORT:-8080}"
-SERVICE_USER="${SERVICE_USER:-tomcat}"
+# Compte applicatif non-root dédié au service Tomcat (aligné sur "jenkinsusr" côté Jenkins)
+SERVICE_USER="${SERVICE_USER:-tomcatusr}"
 CATALINA_JVM_OPTS="${CATALINA_JVM_OPTS:--Xms256m -Xmx512m -Djava.security.egd=file:/dev/./urandom}"
 INSTALL_PARENT="/opt"
 INSTALL_ROOT="${INSTALL_PARENT}/tomcat-${TOMCAT_VERSION}"
@@ -284,7 +285,7 @@ resolve_java_home() {
 }
 
 # ----------------------------------------------------------------------------
-# Utilisateur de service dédié
+# Utilisateur de service dédié (compte applicatif non-root)
 # ----------------------------------------------------------------------------
 create_service_user() {
     if id -u "$SERVICE_USER" &>/dev/null; then
@@ -294,7 +295,7 @@ create_service_user() {
 
     useradd --system --no-create-home --shell /sbin/nologin "$SERVICE_USER"
     register_rollback "userdel '${SERVICE_USER}' 2>/dev/null || true"
-    log "Utilisateur système ${SERVICE_USER} créé."
+    log "Utilisateur système ${SERVICE_USER} créé (compte applicatif non-root)."
 }
 
 # ----------------------------------------------------------------------------
@@ -451,7 +452,25 @@ configure_selinux() {
 }
 
 # ----------------------------------------------------------------------------
-# Service systemd durci avec validation
+# Pare-feu — ouverture du port applicatif si firewalld est présent et actif
+# ----------------------------------------------------------------------------
+configure_firewall() {
+    command -v firewall-cmd &>/dev/null || { log "firewalld absent, étape ignorée."; return 0; }
+    systemctl is-active --quiet firewalld || { log "firewalld inactif, étape ignorée."; return 0; }
+
+    if firewall-cmd --query-port="${HTTP_PORT}/tcp" &>/dev/null; then
+        log "Port ${HTTP_PORT}/tcp déjà ouvert dans firewalld."
+        return 0
+    fi
+
+    firewall-cmd --permanent --add-port="${HTTP_PORT}/tcp"
+    firewall-cmd --reload
+    register_rollback "firewall-cmd --permanent --remove-port='${HTTP_PORT}/tcp' && firewall-cmd --reload"
+    log "Port ${HTTP_PORT}/tcp ouvert dans firewalld."
+}
+
+# ----------------------------------------------------------------------------
+# Service systemd durci avec validation (compte applicatif SERVICE_USER)
 # ----------------------------------------------------------------------------
 install_systemd_service() {
     local java_home
@@ -511,125 +530,46 @@ EOF
     systemctl daemon-reload
     systemctl enable tomcat 2>/dev/null || log "Avertissement: Impossible d'activer le service"
 
-    if ! systemctl restart tomcat; then
-        journalctl -u tomcat --no-pager -n 20 | tee -a "$LOG_FILE"
-        die "Le service Tomcat n'a pas démarré correctement"
+    if ! systemctl is-enabled tomcat &>/dev/null; then
+        log "Avertissement: le service tomcat n'est pas activé au démarrage."
     fi
+}
 
-    local max_wait=30
-    local wait_time=0
-    while [ $wait_time -lt $max_wait ]; do
-        if systemctl is-active --quiet tomcat; then
-            log "Service Tomcat actif après ${wait_time}s"
-            break
-        fi
-        sleep 1
-        wait_time=$((wait_time + 1))
+# ----------------------------------------------------------------------------
+# Démarrage + validation (service actif, port à l'écoute, réponse HTTP)
+# ----------------------------------------------------------------------------
+start_and_validate_service() {
+    log "Démarrage du service tomcat..."
+    systemctl restart tomcat
+
+    local i
+    for i in $(seq 1 15); do
+        systemctl is-active --quiet tomcat && break
+        sleep 2
     done
 
     if ! systemctl is-active --quiet tomcat; then
-        journalctl -u tomcat --no-pager -n 20 | tee -a "$LOG_FILE"
-        die "Le service Tomcat n'a pas démarré dans les ${max_wait}s"
+        log "Le service tomcat n'a pas démarré. Dernières lignes de journal:"
+        journalctl -u tomcat -n 50 --no-pager | tee -a "$LOG_FILE"
+        die "Échec du démarrage du service tomcat."
     fi
+    log "Service tomcat actif."
 
-    log "Service Tomcat installé et actif"
-}
-
-# ----------------------------------------------------------------------------
-# Pare-feu — best effort avec logging
-# ----------------------------------------------------------------------------
-configure_firewall() {
-    if ! command -v firewall-cmd &>/dev/null; then
-        log "firewall-cmd non disponible, ouverture du port ${HTTP_PORT} ignorée"
-        return 0
-    fi
-
-    if ! systemctl is-active --quiet firewalld 2>/dev/null; then
-        log "firewalld inactif, ouverture du port ${HTTP_PORT} ignorée"
-        return 0
-    fi
-
-    log "Configuration du pare-feu..."
-    if firewall-cmd --permanent --add-port="${HTTP_PORT}/tcp" 2>/dev/null; then
-        if firewall-cmd --reload 2>/dev/null; then
-            log "Port ${HTTP_PORT}/tcp ouvert dans firewalld"
-        else
-            log "Avertissement: Firewalld n'a pas pu recharger la configuration"
-        fi
-    else
-        log "Avertissement: Impossible d'ouvrir le port ${HTTP_PORT} dans firewalld"
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Vérification post-installation
-# ----------------------------------------------------------------------------
-verify_installation() {
-    log "Vérification post-installation..."
-
-    if ! systemctl is-active --quiet tomcat; then
-        die "Le service Tomcat n'est pas actif après l'installation"
-    fi
-
-    local max_wait=30
-    local wait_time=0
-    while [ $wait_time -lt $max_wait ]; do
-        if ss -tlnp | grep -q ":${HTTP_PORT}"; then
-            log "Port ${HTTP_PORT} en écoute"
+    log "Vérification de l'écoute sur le port ${HTTP_PORT}..."
+    local listening=0
+    for i in $(seq 1 15); do
+        if ss -tln | grep -q ":${HTTP_PORT}\b"; then
+            listening=1
             break
         fi
-        sleep 1
-        wait_time=$((wait_time + 1))
+        sleep 2
     done
+    [ "$listening" -eq 1 ] || die "Tomcat est actif mais le port ${HTTP_PORT} n'écoute pas."
 
-    if ! ss -tlnp | grep -q ":${HTTP_PORT}"; then
-        log "Avertissement: Le port ${HTTP_PORT} n'est pas en écoute après ${max_wait}s"
-        systemctl status tomcat --no-pager | tee -a "$LOG_FILE"
-    fi
-
-    if curl -fsS --max-time 5 "http://localhost:${HTTP_PORT}" -o /dev/null 2>/dev/null; then
-        log "Tomcat répond sur http://localhost:${HTTP_PORT}"
+    if curl -fsS --max-time 10 -o /dev/null "http://127.0.0.1:${HTTP_PORT}/"; then
+        log "Tomcat répond correctement en HTTP sur le port ${HTTP_PORT}."
     else
-        log "Avertissement: Tomcat ne répond pas sur http://localhost:${HTTP_PORT}"
-    fi
-
-    log "Vérification post-installation terminée"
-}
-
-# ----------------------------------------------------------------------------
-# Upgrade - Détection de la dernière version (sans dépendance à grep -P)
-# ----------------------------------------------------------------------------
-get_latest_version() {
-    local major="$1"
-    local url="https://archive.apache.org/dist/tomcat/tomcat-${major}/"
-    local latest
-    # Extraction portable (ERE via grep -oE, pas de PCRE) : liste les répertoires
-    # de version type "vX.Y.Z/", ne garde que le numéro, trie en version, prend le dernier.
-    latest=$(curl -fsS "$url" \
-        | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+/' \
-        | sed -E 's#^v([0-9]+\.[0-9]+\.[0-9]+)/$#\1#' \
-        | sort -V \
-        | tail -1)
-    echo "$latest"
-}
-
-handle_upgrade() {
-    if [ "$UPGRADE" -eq 1 ]; then
-        local latest
-        latest="$(get_latest_version "$TOMCAT_MAJOR")"
-        if [ -z "$latest" ]; then
-            log "Impossible de déterminer la dernière version, utilisation de ${TOMCAT_VERSION}"
-            return 0
-        fi
-        if [ "$latest" != "$TOMCAT_VERSION" ]; then
-            log "Mise à niveau de ${TOMCAT_VERSION} vers ${latest}"
-            TOMCAT_VERSION="$latest"
-            INSTALL_ROOT="${INSTALL_PARENT}/tomcat-${TOMCAT_VERSION}"
-            TOMCAT_URL="https://archive.apache.org/dist/tomcat/tomcat-${TOMCAT_MAJOR}/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
-            FORCE=1
-        else
-            log "Déjà à la dernière version: ${TOMCAT_VERSION}"
-        fi
+        log "Avertissement: le port écoute mais Tomcat ne répond pas encore (peut nécessiter quelques secondes de plus)."
     fi
 }
 
@@ -637,16 +577,12 @@ handle_upgrade() {
 # Orchestration
 # ----------------------------------------------------------------------------
 main() {
-    mkdir -p "$(dirname "$LOG_FILE")"
-    require_root
     acquire_lock
+    require_root
     check_dependencies
     detect_os
     ensure_network
     fix_repos_eol
-
-    handle_upgrade
-
     install_java
     create_service_user
     install_tomcat
@@ -654,13 +590,18 @@ main() {
     configure_selinux
     install_systemd_service
     configure_firewall
-    verify_installation
+    start_and_validate_service
 
+    ROLLBACK_ACTIONS=()  # succès complet : plus rien à défaire en cas de sortie normale
+
+    log "----------------------------------------------------------------"
     log "Installation terminée avec succès."
-    log "Résumé du service:"
-    systemctl status tomcat --no-pager | head -20 | tee -a "$LOG_FILE"
-    log "Journal complet: ${LOG_FILE}"
-    log "Tomcat disponible sur http://$(hostname -f):${HTTP_PORT}/"
+    log "  Tomcat:      ${TOMCAT_VERSION}"
+    log "  Utilisateur: ${SERVICE_USER} (compte applicatif non-root, /sbin/nologin)"
+    log "  Port:        ${HTTP_PORT}"
+    log "  Répertoire:  ${CURRENT_LINK} -> ${INSTALL_ROOT}"
+    log "  Log complet: ${LOG_FILE}"
+    log "----------------------------------------------------------------"
 }
 
 main "$@"
