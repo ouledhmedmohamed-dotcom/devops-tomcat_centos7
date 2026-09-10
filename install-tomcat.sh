@@ -225,6 +225,15 @@ fix_repos_eol() {
     local repo_files=(/etc/yum.repos.d/CentOS-*.repo)
     [ "${#repo_files[@]}" -gt 0 ] || { log "Aucun fichier repo CentOS-*.repo trouvé."; return 0; }
 
+    # Idempotence : si la bascule a déjà été appliquée lors d'une exécution
+    # précédente, ne pas re-vider le cache yum à chaque lancement — cela
+    # forcerait install_java() à interroger un cache tout juste vidé et à
+    # échouer par manque de temps de reconstruction.
+    if grep -q "vault.centos.org" "${repo_files[@]}" 2>/dev/null; then
+        log "Dépôts déjà basculés vers vault.centos.org, étape ignorée."
+        return 0
+    fi
+
     if ! curl -fsS --max-time 5 http://mirrorlist.centos.org | grep -q "mirror.centos.org" 2>/dev/null; then
         log "Miroir CentOS EOL détecté, bascule vers vault.centos.org."
         local backup_dir="/etc/yum.repos.d/backup.$(date +%s)"
@@ -234,6 +243,9 @@ fix_repos_eol() {
         sed -i 's/mirrorlist=/#mirrorlist=/g' "${repo_files[@]}"
         sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "${repo_files[@]}"
         yum clean all 2>/dev/null || true
+
+        log "Reconstruction du cache yum depuis vault.centos.org (peut prendre un moment)..."
+        yum makecache fast 2>/dev/null || yum makecache 2>/dev/null || true
 
         log "Dépôts sauvegardés dans ${backup_dir}"
     fi
@@ -470,138 +482,4 @@ configure_firewall() {
 }
 
 # ----------------------------------------------------------------------------
-# Service systemd durci avec validation (compte applicatif SERVICE_USER)
-# ----------------------------------------------------------------------------
-install_systemd_service() {
-    local java_home
-    java_home="$(resolve_java_home)"
-    log "JAVA_HOME résolu: ${java_home}"
-
-    local unit="/etc/systemd/system/tomcat.service"
-    local unit_backup="${TMP_DIR}/tomcat.service.bak"
-
-    if [ -f "$unit" ]; then
-        cp "$unit" "$unit_backup"
-        register_rollback "cp '${unit_backup}' '${unit}' && systemctl daemon-reload"
-    else
-        register_rollback "rm -f '${unit}' && systemctl daemon-reload 2>/dev/null || true"
-    fi
-
-    cat > "$unit" <<EOF
-[Unit]
-Description=Apache Tomcat ${TOMCAT_MAJOR}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_USER}
-UMask=0027
-
-Environment=JAVA_HOME=${java_home}
-Environment=CATALINA_HOME=${CURRENT_LINK}
-Environment=CATALINA_BASE=${CURRENT_LINK}
-Environment=CATALINA_OPTS=${CATALINA_JVM_OPTS}
-
-ExecStart=${CURRENT_LINK}/bin/catalina.sh run
-ExecStop=/bin/kill -TERM \$MAINPID
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=60
-TimeoutStopSec=30
-SuccessExitStatus=143
-LimitNOFILE=65535
-
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=${CURRENT_LINK}/logs ${CURRENT_LINK}/temp ${CURRENT_LINK}/work ${CURRENT_LINK}/webapps
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    if ! systemd-analyze verify "$unit" 2>/dev/null; then
-        log "Avertissement: Le fichier unité systemd ne passe pas la validation"
-    fi
-
-    systemctl daemon-reload
-    systemctl enable tomcat 2>/dev/null || log "Avertissement: Impossible d'activer le service"
-
-    if ! systemctl is-enabled tomcat &>/dev/null; then
-        log "Avertissement: le service tomcat n'est pas activé au démarrage."
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Démarrage + validation (service actif, port à l'écoute, réponse HTTP)
-# ----------------------------------------------------------------------------
-start_and_validate_service() {
-    log "Démarrage du service tomcat..."
-    systemctl restart tomcat
-
-    local i
-    for i in $(seq 1 15); do
-        systemctl is-active --quiet tomcat && break
-        sleep 2
-    done
-
-    if ! systemctl is-active --quiet tomcat; then
-        log "Le service tomcat n'a pas démarré. Dernières lignes de journal:"
-        journalctl -u tomcat -n 50 --no-pager | tee -a "$LOG_FILE"
-        die "Échec du démarrage du service tomcat."
-    fi
-    log "Service tomcat actif."
-
-    log "Vérification de l'écoute sur le port ${HTTP_PORT}..."
-    local listening=0
-    for i in $(seq 1 15); do
-        if ss -tln | grep -q ":${HTTP_PORT}\b"; then
-            listening=1
-            break
-        fi
-        sleep 2
-    done
-    [ "$listening" -eq 1 ] || die "Tomcat est actif mais le port ${HTTP_PORT} n'écoute pas."
-
-    if curl -fsS --max-time 10 -o /dev/null "http://127.0.0.1:${HTTP_PORT}/"; then
-        log "Tomcat répond correctement en HTTP sur le port ${HTTP_PORT}."
-    else
-        log "Avertissement: le port écoute mais Tomcat ne répond pas encore (peut nécessiter quelques secondes de plus)."
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Orchestration
-# ----------------------------------------------------------------------------
-main() {
-    acquire_lock
-    require_root
-    check_dependencies
-    detect_os
-    ensure_network
-    fix_repos_eol
-    install_java
-    create_service_user
-    install_tomcat
-    configure_tomcat_port
-    configure_selinux
-    install_systemd_service
-    configure_firewall
-    start_and_validate_service
-
-    ROLLBACK_ACTIONS=()  # succès complet : plus rien à défaire en cas de sortie normale
-
-    log "----------------------------------------------------------------"
-    log "Installation terminée avec succès."
-    log "  Tomcat:      ${TOMCAT_VERSION}"
-    log "  Utilisateur: ${SERVICE_USER} (compte applicatif non-root, /sbin/nologin)"
-    log "  Port:        ${HTTP_PORT}"
-    log "  Répertoire:  ${CURRENT_LINK} -> ${INSTALL_ROOT}"
-    log "  Log complet: ${LOG_FILE}"
-    log "----------------------------------------------------------------"
-}
-
-main "$@"
+# Service systemd durci avec validation
