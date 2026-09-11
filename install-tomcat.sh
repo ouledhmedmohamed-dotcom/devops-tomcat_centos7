@@ -347,7 +347,12 @@ download_and_verify_tomcat() {
     fi
 
     log "Intégrité vérifiée avec succès."
-    echo "$archive"
+    # Ne pas 'echo' le chemin ici : cette fonction appelle log() plus haut,
+    # qui écrit aussi sur stdout (via tee). Si l'appelant capturait la sortie
+    # avec archive="$(download_and_verify_tomcat)", il récupérerait tout le
+    # texte des logs mélangé au chemin. On expose le résultat via une
+    # variable globale à la place.
+    DOWNLOADED_ARCHIVE="$archive"
 }
 
 install_tomcat() {
@@ -359,7 +364,9 @@ install_tomcat() {
     fi
 
     local archive
-    archive="$(download_and_verify_tomcat)"
+    DOWNLOADED_ARCHIVE=""
+    download_and_verify_tomcat
+    archive="$DOWNLOADED_ARCHIVE"
 
     local previous_target=""
     if [ -L "$CURRENT_LINK" ] && [ -d "$CURRENT_LINK" ]; then
